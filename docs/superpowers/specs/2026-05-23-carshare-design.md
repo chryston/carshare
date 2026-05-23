@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23  
 **Author:** Copilot (Spec-Driven Development session)  
-**Status:** Draft — Pending Adversarial Review  
+**Status:** Revised — Post Adversarial Review (10 findings accepted)  
 **Branch:** `spec/initial-sdd`
 
 ---
@@ -137,21 +137,21 @@ Added by Owner via email invite.
 
 | ID | Story | Acceptance Criteria |
 |---|---|---|
-| CAL-01 | As a Member, I can connect my Google Calendar | OAuth consent grants `calendar.events` scope; refresh token stored encrypted in `profiles.google_calendar_token` |
-| CAL-02 | When a booking is confirmed, an event is created in my calendar | Edge Function `/calendar-sync` called after booking creation; `google_calendar_event_id` stored on booking |
-| CAL-03 | When a booking is cancelled or overridden, the calendar event is deleted | Edge Function called with event ID; event removed from Google Calendar |
-| CAL-04 | As a Member, I can disconnect my Google Calendar | `google_calendar_token` set to NULL; no further syncs |
+| CAL-01 | As a Member, I can connect my Google Calendar | OAuth consent grants `calendar.events` scope; refresh token stored encrypted in `user_oauth_tokens` |
+| CAL-02 | When a booking is confirmed, calendar sync is queued | Booking created with `calendar_sync_status='pending'`; Supabase Cron picks it up and creates the event |
+| CAL-03 | When a booking is cancelled or overridden, the calendar event is deleted | Cron/Edge Function deletes event; `calendar_sync_status='synced'` updated to `'pending_delete'` |
+| CAL-04 | As a Member, I can disconnect my Google Calendar | `user_oauth_tokens` row deleted; no further syncs |
 
 ### 4.2 Edge Case Handling
 
 | Scenario | Handling |
 |---|---|
-| Two members submit overlapping bookings simultaneously | Advisory lock in Edge Function prevents race condition; second writer receives 409 |
+| Two members submit overlapping bookings simultaneously | PostgreSQL GiST exclusion constraint rejects overlap atomically; second writer receives 409 |
 | Owner overrides booking already synced to Google Calendar | Override Edge Function deletes original calendar event; creates new one for Owner |
 | Member removed from family mid-booking | Their `status → removed`; all their future bookings cancelled; Edge Function deletes their calendar events |
 | Car deleted with future bookings | Deletion blocked; Owner must cancel all future bookings first |
 | Address deleted referenced in future booking | Deletion blocked; address_line is preserved on existing bookings via a snapshot column |
-| Google Calendar token expires | Edge Function detects 401, uses refresh token; if refresh fails, marks `google_calendar_token=NULL` and returns error code to UI |
+| Google Calendar token expires | Edge Function detects 401, uses refresh token from `user_oauth_tokens`; if refresh fails, deletes the token row and sets `calendar_sync_status='failed'`; UI prompts reconnect |
 | User has no family | Post-login redirect to `/onboarding` — create or join a family |
 | Invite link clicked by wrong Google account | Edge Function validates email match; returns 403 if mismatch |
 
@@ -200,13 +200,12 @@ React calls supabase.functions.invoke('create-booking', { body })
 Edge Function: create-booking
   1. Verify JWT → extract user_id
   2. Confirm user is active member of family_id
-  3. Acquire pg_try_advisory_xact_lock(car_id_hash, epoch_start)
-  4. SELECT count(*) FROM bookings WHERE car_id = ? AND status = 'confirmed'
-     AND tstzrange(start_time, end_time) && tstzrange(req.start, req.end)
-  5. If count > 0 → return 409 { conflict: { user, start, end } }
-  6. INSERT INTO bookings (...) RETURNING *
-  7. If user has google_calendar_token → invoke calendar-sync
-  8. Return 201 { booking }
+  3. Assert start_time >= now() - interval '5 minutes' → 400 if in the past
+  4. INSERT INTO bookings (..., calendar_sync_status='pending') RETURNING *
+     -- GiST exclusion constraint rejects overlaps atomically at DB level;
+     -- constraint violation (23P01) caught → returned as 409
+  5. If constraint violation → 409 { error: 'BOOKING_CONFLICT' }
+  6. Return 201 { booking }  -- calendar sync handled async by Cron
         │
         ▼
 React updates UI (refetch bookings list)
@@ -247,8 +246,25 @@ CREATE TABLE profiles (
   id                      UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   full_name               TEXT,
   avatar_url              TEXT,
-  google_calendar_token   JSONB,          -- { access_token, refresh_token, expiry }
   created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─────────────────────────────────────────────────────────────
+-- user_oauth_tokens
+-- Stores Google OAuth tokens with NO client-accessible RLS SELECT.
+-- Only Edge Functions (service_role key) may read this table.
+-- ADR-11: Separated from profiles to eliminate credential exposure.
+-- ─────────────────────────────────────────────────────────────
+CREATE TABLE user_oauth_tokens (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id       UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  provider      TEXT NOT NULL DEFAULT 'google',
+  access_token  TEXT NOT NULL,
+  refresh_token TEXT NOT NULL,
+  expiry        TIMESTAMPTZ NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, provider)
 );
 
 -- ─────────────────────────────────────────────────────────────
@@ -257,7 +273,7 @@ CREATE TABLE profiles (
 CREATE TABLE families (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name        TEXT NOT NULL,
-  owner_id    UUID NOT NULL REFERENCES profiles(id),
+  -- ADR-12: owner_id removed — ownership derived exclusively from family_members.role='owner'
   created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -265,17 +281,28 @@ CREATE TABLE families (
 -- family_members
 -- ─────────────────────────────────────────────────────────────
 CREATE TABLE family_members (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  family_id   UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
-  user_id     UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-  role        TEXT NOT NULL CHECK (role IN ('owner', 'member')),
-  status      TEXT NOT NULL DEFAULT 'pending'
-                CHECK (status IN ('pending', 'active', 'removed')),
-  invited_email TEXT,                     -- email used for invite validation
-  invited_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  joined_at   TIMESTAMPTZ,
-  UNIQUE (family_id, user_id)
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  family_id       UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+  user_id         UUID REFERENCES profiles(id) ON DELETE CASCADE,  -- NULL until invite accepted
+  role            TEXT NOT NULL CHECK (role IN ('owner', 'member')),
+  status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'active', 'removed')),
+  invited_email   TEXT NOT NULL,               -- email used for invite validation
+  invite_token    TEXT UNIQUE,                 -- sha256(raw_token); NULL after acceptance
+  invite_token_expires_at TIMESTAMPTZ,
+  invited_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  joined_at       TIMESTAMPTZ
 );
+
+-- ADR-13: Partial unique index — allows re-inviting a previously removed member
+CREATE UNIQUE INDEX idx_family_members_active
+  ON family_members (family_id, user_id)
+  WHERE status != 'removed';
+
+-- ADR-12: Enforce single-owner per family at DB level
+CREATE UNIQUE INDEX idx_family_single_owner
+  ON family_members (family_id)
+  WHERE role = 'owner' AND status = 'active';
 
 -- ─────────────────────────────────────────────────────────────
 -- addresses
@@ -315,25 +342,35 @@ CREATE TABLE bookings (
   user_id                   UUID NOT NULL REFERENCES profiles(id),
   start_time                TIMESTAMPTZ NOT NULL,
   end_time                  TIMESTAMPTZ NOT NULL,
-  pickup_address_id         UUID REFERENCES addresses(id) ON DELETE SET NULL,
-  dropoff_address_id        UUID REFERENCES addresses(id) ON DELETE SET NULL,
-  -- Snapshot of address text at time of booking (preserved if address deleted)
-  pickup_address_snapshot   TEXT,
-  dropoff_address_snapshot  TEXT,
+  -- ADR-14: ON DELETE RESTRICT — address deletion blocked while referenced by non-cancelled bookings
+  pickup_address_id         UUID REFERENCES addresses(id) ON DELETE RESTRICT,
+  dropoff_address_id        UUID REFERENCES addresses(id) ON DELETE RESTRICT,
+  -- Snapshot of address text at time of booking (denormalized for historical accuracy)
+  pickup_address_snapshot   TEXT NOT NULL,
+  dropoff_address_snapshot  TEXT NOT NULL,
   description               TEXT,
   status                    TEXT NOT NULL DEFAULT 'confirmed'
-                              CHECK (status IN ('confirmed', 'cancelled', 'overridden')),
+                              CHECK (status IN ('confirmed', 'cancelled', 'overridden', 'completed')),
   overridden_by             UUID REFERENCES profiles(id),
   overridden_at             TIMESTAMPTZ,
+  replacement_booking_id    UUID REFERENCES bookings(id),  -- points to the new booking that replaced this one
+  -- ADR-15: Async calendar sync — booking correctness decoupled from Google API availability
+  calendar_sync_status      TEXT NOT NULL DEFAULT 'pending'
+                              CHECK (calendar_sync_status IN ('pending', 'synced', 'failed', 'not_connected')),
   google_calendar_event_id  TEXT,
   created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CONSTRAINT valid_time_range CHECK (end_time > start_time)
 );
 
--- Index for conflict detection queries
-CREATE INDEX idx_bookings_car_time
-  ON bookings (car_id, start_time, end_time)
-  WHERE status = 'confirmed';
+-- ADR-02 (revised): GiST exclusion constraint replaces advisory lock.
+-- Conflict detection is atomic, index-enforced, race-condition-free.
+-- Requires btree_gist extension.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE bookings ADD CONSTRAINT bookings_no_overlap
+  EXCLUDE USING gist (
+    car_id WITH =,
+    tstzrange(start_time, end_time) WITH &&
+  ) WHERE (status = 'confirmed');
 
 -- ─────────────────────────────────────────────────────────────
 -- DB Trigger: create profile on new auth user
@@ -388,12 +425,13 @@ $$;
 
 | Table | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| `profiles` | own row only | — (trigger) | own row only | — |
+| `profiles` | own row + is_family_member (name/avatar only) | — (trigger) | own row only | — |
+| `user_oauth_tokens` | **NONE** (service_role only) | own row (via Edge Fn) | own row (via Edge Fn) | own row |
 | `families` | is_family_member | any auth user | is_family_owner | is_family_owner |
 | `family_members` | is_family_member | is_family_owner | is_family_owner | is_family_owner |
 | `addresses` | is_family_member | is_family_owner | is_family_owner | is_family_owner |
 | `cars` | is_family_member | is_family_owner | is_family_owner OR own location update | is_family_owner |
-| `bookings` | is_family_member | is_family_member (via Edge Fn) | own row OR is_family_owner | — (soft cancel via status) |
+| `bookings` | is_family_member | **BLOCKED** (via Edge Fn only) | own row OR is_family_owner | — (soft cancel via status) |
 
 > **Note:** `bookings` INSERT goes through the Edge Function (`SECURITY DEFINER`), which performs the conflict check atomically. Direct client inserts to `bookings` are blocked by RLS to prevent conflict-check bypasses.
 
@@ -405,7 +443,7 @@ All Edge Functions are Deno-based, deployed to Supabase, and called via `supabas
 
 ### `POST /create-booking`
 
-**Purpose:** Atomically check for conflicts and insert a booking.
+**Purpose:** Validate and insert a booking. Conflict detection delegated to GiST constraint.
 
 ```
 Request body:
@@ -415,17 +453,17 @@ Request body:
 Steps:
   1. Verify Bearer JWT → user_id
   2. Assert user is active member of family_id
-  3. pg_try_advisory_xact_lock(hashtext(car_id::text))
-  4. Overlap query on bookings (status=confirmed, same car_id)
-  5. If conflict → 409 { error: 'BOOKING_CONFLICT', conflicting_booking: { ... } }
-  6. INSERT booking + populate address snapshots
-  7. If user has google_calendar_token → call /calendar-sync internally
-  8. 201 { booking }
+  3. Assert start_time >= now() - interval '5 minutes' → 400 BOOKING_IN_PAST
+  4. Fetch address labels → populate address snapshots
+  5. INSERT bookings (..., calendar_sync_status='pending', pickup/dropoff_address_snapshot)
+     -- GiST exclusion constraint fires on overlap; raises exclusion_violation (23P01)
+  6. If exclusion_violation → query conflicting booking → 409 { error: 'BOOKING_CONFLICT', conflicting_booking: { user, start, end } }
+  7. 201 { booking }  -- calendar sync handled async by Supabase Cron
 ```
 
 ### `POST /override-booking`
 
-**Purpose:** Owner cancels an existing booking and optionally creates a replacement.
+**Purpose:** Owner overrides an existing booking and optionally creates a replacement.
 
 ```
 Request body:
@@ -433,33 +471,33 @@ Request body:
 
 Steps:
   1. Verify JWT → assert is_family_owner
-  2. UPDATE bookings SET status='overridden', overridden_by, overridden_at
-  3. If original had google_calendar_event_id → delete calendar event
-  4. If new_booking provided → call /create-booking logic
-  5. 200 { overridden_booking, new_booking? }
+  2. UPDATE bookings SET status='overridden', overridden_by=user_id, overridden_at=now()
+  3. If original had google_calendar_event_id → queue calendar deletion (set calendar_sync_status='pending_delete')
+  4. If new_booking provided → run /create-booking logic → get new_booking_id
+  5. UPDATE original booking SET replacement_booking_id = new_booking_id
+  6. 200 { overridden_booking, new_booking? }
 ```
 
 ### `POST /calendar-sync`
 
-**Purpose:** Create, update, or delete a Google Calendar event for a booking.
+**Purpose:** Called by Supabase Cron — create or delete Google Calendar events for pending bookings.
 
 ```
-Request body:
-  action: 'create' | 'delete'
-  booking_id
-  user_id (whose calendar to update)
+Triggered by: Supabase Cron every 1 minute (or called directly by Edge Functions for immediate sync)
 
 Steps:
-  1. Fetch user's google_calendar_token from profiles
-  2. If token expired → use refresh_token to get new access_token; update DB
-  3. If refresh fails → set google_calendar_token=NULL; return { error: 'CALENDAR_TOKEN_REVOKED' }
-  4. action='create' → POST to Calendar API events.insert
-     - Title: "{nickname} — {description}"
-     - Start/end from booking
-     - Location: pickup_address_snapshot
-  5. action='delete' → DELETE calendar API events.delete(event_id)
-  6. UPDATE bookings SET google_calendar_event_id = event_id (on create)
-  7. 200 { event_id? }
+  1. SELECT bookings WHERE calendar_sync_status IN ('pending', 'pending_delete') LIMIT 50
+  2. For each booking → fetch user_oauth_tokens (service_role) for booking.user_id
+  3. If no token row → UPDATE booking SET calendar_sync_status='not_connected'; skip
+  4. If token expired → refresh via Google OAuth; UPDATE user_oauth_tokens; on failure:
+     DELETE user_oauth_tokens row; UPDATE booking SET calendar_sync_status='failed'; skip
+  5. calendar_sync_status='pending' → POST Google Calendar events.insert
+     - Title: "{car.nickname} — {description}"
+     - Start/end from booking; Location: pickup_address_snapshot
+     - On success: UPDATE booking SET google_calendar_event_id=id, calendar_sync_status='synced'
+  6. calendar_sync_status='pending_delete' → DELETE Google Calendar events.delete(event_id)
+     - On success: UPDATE booking SET google_calendar_event_id=NULL, calendar_sync_status='synced'
+  7. On any Google API error: increment retry counter; after 3 failures → calendar_sync_status='failed'
 ```
 
 ### `POST /invite-member`
@@ -472,10 +510,11 @@ Request body:
 
 Steps:
   1. Verify JWT → assert is_family_owner
-  2. Check invited_email not already active member
-  3. INSERT family_members (status='pending', invited_email)
-  4. Generate signed invite URL: /accept-invite?token=<signed_jwt>
-  5. Send email via Supabase SMTP (or Resend API)
+  2. Check invited_email not already an active member of family_id
+  3. Generate cryptographically random token (32 bytes); compute sha256(token)
+  4. INSERT family_members (status='pending', invited_email, invite_token=sha256, invite_token_expires_at=now()+72h)
+     -- partial unique index allows re-invite of removed members
+  5. Send email with raw token: /#/accept-invite?token=<raw_token>
   6. 201 { member_id }
 ```
 
@@ -485,13 +524,16 @@ Steps:
 
 ```
 Request body:
-  token (signed JWT from invite email)
+  token (raw token from invite email link)
 
 Steps:
-  1. Verify invite token (signed with SUPABASE_JWT_SECRET)
-  2. Assert token.email === auth user's Google email
-  3. UPDATE family_members SET status='active', user_id=auth.uid(), joined_at=now()
-  4. 200 { family_id }
+  1. Compute sha256(token); look up family_members WHERE invite_token = sha256
+  2. Assert row exists AND status = 'pending' (not removed/already active)
+  3. Assert invite_token_expires_at > now() → 410 INVITE_EXPIRED
+  4. Assert invited_email === auth user's Google email → 403 EMAIL_MISMATCH
+  5. UPDATE family_members SET status='active', user_id=auth.uid(), joined_at=now(),
+     invite_token=NULL, invite_token_expires_at=NULL
+  6. 200 { family_id }
 ```
 
 ---
@@ -511,11 +553,11 @@ The calendar scope is requested incrementally: only prompted when the user expli
 
 | Field | Location | Notes |
 |---|---|---|
-| `access_token` | `profiles.google_calendar_token` JSONB | Encrypted at rest by Supabase |
-| `refresh_token` | `profiles.google_calendar_token` JSONB | Required for server-side refresh in Edge Function |
-| `expiry` | `profiles.google_calendar_token` JSONB | ISO timestamp; checked before each API call |
+| `access_token` | `user_oauth_tokens.access_token` TEXT | Separate table; no client RLS SELECT |
+| `refresh_token` | `user_oauth_tokens.refresh_token` TEXT | Only accessible via service_role key in Edge Functions |
+| `expiry` | `user_oauth_tokens.expiry` TIMESTAMPTZ | Checked before each API call; refreshed automatically |
 
-The Edge Function reads/writes this field using the Supabase service role key (not exposed to client).
+The `user_oauth_tokens` table has **no RLS SELECT policy** — it is inaccessible to the client entirely. Only Supabase Edge Functions using the service_role key can read or write it.
 
 ### 9.3 Incremental Auth Flow
 
@@ -638,7 +680,7 @@ App
 ```
 1. Two browser tabs simultaneously submit identical overlapping bookings
 2. Expected: exactly one succeeds (201), one fails (409)
-3. Advisory lock ensures no double-insert
+3. Advisory lock ensures no double-insert — replaced by GiST exclusion constraint
 ```
 
 #### T4 — Owner Override
@@ -688,12 +730,17 @@ App
 | ADR | Decision | Rationale |
 |---|---|---|
 | ADR-01 | GitHub Pages + Supabase, no backend server | Zero infrastructure debt; free tier covers family-scale usage |
-| ADR-02 | Conflict check in Edge Function, not client-side | Prevents race conditions; client-side check is non-atomic |
+| ADR-02 | GiST exclusion constraint for conflict detection (not advisory lock) | Advisory locks are incompatible with PgBouncer transaction-mode pooling and have hash collision risks; GiST constraint is atomic, index-enforced, and race-condition-free |
 | ADR-03 | Hash-based routing | GitHub Pages cannot rewrite URLs; hash routing requires no server config |
 | ADR-04 | RLS blocks direct INSERT to bookings | Prevents conflict-check bypass; all booking mutations go through Edge Fn |
 | ADR-05 | Incremental Google Calendar auth | Requesting `calendar.events` scope on first login increases friction; better to request on demand |
-| ADR-06 | Address snapshot on bookings | Allows addresses to be deleted without breaking historical booking records |
+| ADR-06 | Address snapshot on bookings + ON DELETE RESTRICT on address FKs | RESTRICT prevents silent data loss on active bookings; snapshot preserves location text at time of booking for historical accuracy |
 | ADR-07 | Manual refresh over WebSockets | Simpler implementation; family-scale usage doesn't require real-time for v1 |
 | ADR-08 | Multiple cars per family | Future-proofs for households with 2+ vehicles |
 | ADR-09 | Optimistic + Owner Override conflict resolution | Balances user autonomy (first-come) with admin control (owner override) |
-| ADR-10 | google_calendar_token stored in profiles (JSONB) | Avoids a separate tokens table; encrypted at rest; only accessible server-side via service role |
+| ADR-10 | Async calendar sync via Supabase Cron (not inline) | Decouples booking correctness from Google API availability; transient Google failures don't prevent booking creation; retry logic via `calendar_sync_status` column |
+| ADR-11 | OAuth tokens in `user_oauth_tokens` table (no client RLS SELECT) | Separates long-lived credentials from display data in `profiles`; eliminates credential exposure via RLS misconfiguration |
+| ADR-12 | Remove `families.owner_id`; derive ownership from `family_members` only | Eliminates dual source of truth; single-owner enforced by partial unique index; no risk of split-brain ownership |
+| ADR-13 | Partial unique index on `family_members (family_id, user_id) WHERE status != 'removed'` | Allows re-inviting previously removed members; full UNIQUE constraint would permanently block re-invitation |
+| ADR-14 | Invite token stored as `sha256(raw_token)` in DB, expiry 72h, nulled on use | Stateless JWT invites can't be revoked; random tokens with DB lookup support expiry, revocation, and email mismatch validation |
+| ADR-15 | `replacement_booking_id` self-referential FK on bookings | Provides auditable link between overridden booking and its replacement; enables UI to show "your booking was replaced — see here" |
