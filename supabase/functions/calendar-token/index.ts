@@ -25,7 +25,7 @@ async function getToken(userId: string): Promise<Response> {
   const { data } = await db.from('google_calendar_tokens')
     .select('id, expires_at')
     .eq('user_id', userId)
-    .single()
+    .maybeSingle()
   return ok({ connected: !!data, expires_at: data?.expires_at ?? null })
 }
 
