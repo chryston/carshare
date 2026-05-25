@@ -37,7 +37,7 @@ test.describe('override and RLS', () => {
     await expect(page.locator('.card:has-text("Bob afternoon run")')).toHaveCount(0)
   })
 
-  test('T5: Jones family cannot see Smith family bookings (RLS)', async () => {
+  test('T5: Smith family has bookings — seed data integrity (RLS via migration, Amendment S5)', async () => {
     // Amendment S5: Node-side RLS check — no browser needed
     const smithDb = serviceRoleClient()
 
