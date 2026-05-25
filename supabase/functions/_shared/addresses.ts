@@ -3,14 +3,17 @@ import { AppError } from './errors.ts'
 
 export async function fetchAddressSnapshots(pickupId: string, dropoffId: string) {
   const db = serviceDb()
+  const ids = [...new Set([pickupId, dropoffId])]
   const { data: addrs, error } = await db.from('addresses')
     .select('id, label, line1, city, postcode')
-    .in('id', [pickupId, dropoffId])
-  if (error || !addrs || addrs.length < 2) throw new AppError('Invalid address IDs', 400)
-  const pickup = addrs.find(a => a.id === pickupId)!
-  const dropoff = addrs.find(a => a.id === dropoffId)!
+    .in('id', ids)
+  if (error) throw new AppError('Failed to fetch addresses', 500)
+  const pickup = addrs?.find(a => a.id === pickupId)
+  const dropoff = addrs?.find(a => a.id === dropoffId)
+  if (!pickup || !dropoff) throw new AppError('Invalid address IDs', 400)
+  const format = (a: typeof pickup) => `${a.label} — ${a.line1}, ${a.city} ${a.postcode}`
   return {
-    pickup_snapshot: `${pickup.label} — ${pickup.line1}, ${pickup.city} ${pickup.postcode}`,
-    dropoff_snapshot: `${dropoff.label} — ${dropoff.line1}, ${dropoff.city} ${dropoff.postcode}`,
+    pickup_snapshot: format(pickup),
+    dropoff_snapshot: format(dropoff),
   }
 }

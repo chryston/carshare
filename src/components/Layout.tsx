@@ -8,7 +8,7 @@ export function Layout() {
 
   async function signOut() {
     await supabase.auth.signOut()
-    navigate('#/login')
+    navigate('/login')
   }
 
   return (
