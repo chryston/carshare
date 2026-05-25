@@ -46,7 +46,7 @@ export function FamilyProvider({ children }: { children: ReactNode }) {
 
     const { data: allMembers } = await supabase
       .from('family_members')
-      .select('*')
+      .select('*, profiles(display_name, avatar_url)')
       .eq('family_id', familyData.id)
       .neq('status', 'removed')
 

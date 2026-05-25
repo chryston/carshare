@@ -11,7 +11,15 @@ import type { Database } from '../types/database.types'
 const inviteSchema = z.object({ email: z.string().email('Valid email required') })
 type InviteForm = z.infer<typeof inviteSchema>
 
-type Member = Database['public']['Tables']['family_members']['Row']
+type Member = {
+  id: string
+  role: string
+  status: string
+  joined_at: string | null
+  user_id: string | null
+  invited_email: string | null
+  profiles: { display_name: string; avatar_url: string | null } | null
+}
 
 export function MembersPage() {
   const { family, members, myMembership, reload } = useFamily()
@@ -40,7 +48,7 @@ function MembersList({ members, isOwner, familyId, onChanged }: {
         {members.map((m) => (
           <li key={m.id} className="list-group-item d-flex justify-content-between align-items-center">
             <div>
-              <strong>{m.invited_email ?? m.user_id ?? 'Unknown'}</strong>
+              <strong>{m.profiles?.display_name ?? m.invited_email ?? 'Unknown'}</strong>
               <span className={`badge ms-2 bg-${m.status === 'active' ? 'success' : 'secondary'}`}>{m.status}</span>
               <span className="badge ms-1 bg-info text-dark">{m.role}</span>
             </div>
