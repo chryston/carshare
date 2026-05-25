@@ -3930,3 +3930,284 @@ Both reviewers raised the `bookings.status` question:
 Option A: already in the plan, simpler schema, requires checking `replacement_booking_id` to differentiate.
 Option B: more explicit, requires adding `'overridden'` to `booking_status` enum and updating `BookingDetailPage` badge logic and `override_booking` PL/pgSQL function.
 
+
+---
+
+## Simplification Review Amendments
+
+> **Apply these in addition to the Adversarial Review Amendments above.**
+
+---
+
+### Simplification S1 — Delete `AppError` unit test
+
+**Location:** Task 1, `src/lib/errors.test.ts`
+
+Delete this file entirely. It tests that a constructor stores its arguments — JavaScript semantics, not app behaviour. Coverage comes from E2E tests.
+
+```bash
+rm src/lib/errors.test.ts
+```
+
+Also remove `toastError`'s redundant branch — both `AppError` and `Error` did the same thing. Replace `src/lib/errors.ts` with:
+
+```typescript
+import toast from 'react-hot-toast'
+
+export class AppError extends Error {
+  constructor(message: string, public readonly code?: string) {
+    super(message)
+    this.name = 'AppError'
+  }
+}
+
+export function toastError(err: unknown): void {
+  toast.error(err instanceof Error ? err.message : 'An unexpected error occurred')
+}
+```
+
+---
+
+### Simplification S2 — `serviceDb()` is a no-op singleton in Deno
+
+**Location:** Task 7, `supabase/functions/_shared/db.ts`
+
+Deno Edge Functions are isolated per-request — the lazy singleton caches nothing. Replace with a plain factory:
+
+```typescript
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import type { Database } from '../../../src/types/database.types.ts'
+
+export function serviceDb() {
+  return createClient<Database>(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+}
+```
+
+---
+
+### Simplification S3 — Move `fetchAddressSnapshots` to `_shared`
+
+**Location:** Tasks 16 + 21, duplicated in `create-booking/index.ts` and `override-booking/index.ts`
+
+**Create `supabase/functions/_shared/addresses.ts`:**
+
+```typescript
+import { serviceDb } from './db.ts'
+import { AppError } from './errors.ts'
+
+export async function fetchAddressSnapshots(pickupId: string, dropoffId: string) {
+  const db = serviceDb()
+  const { data: addrs, error } = await db.from('addresses')
+    .select('id, label, line1, city, postcode')
+    .in('id', [pickupId, dropoffId])
+  if (error || !addrs || addrs.length < 2) throw new AppError('Invalid address IDs', 400)
+  const pickup = addrs.find(a => a.id === pickupId)!
+  const dropoff = addrs.find(a => a.id === dropoffId)!
+  return {
+    pickup_snapshot: `${pickup.label} — ${pickup.line1}, ${pickup.city} ${pickup.postcode}`,
+    dropoff_snapshot: `${dropoff.label} — ${dropoff.line1}, ${dropoff.city} ${dropoff.postcode}`,
+  }
+}
+```
+
+In both `create-booking/index.ts` and `override-booking/index.ts`, delete the local `fetchAddressSnapshots` function and add:
+
+```typescript
+import { fetchAddressSnapshots } from '../_shared/addresses.ts'
+```
+
+---
+
+### Simplification S4 — Merge calendar Edge Functions into one `calendar-token` function
+
+**Location:** Task 24b + Amendment A12 — `check-calendar-connection` and `store-calendar-token`
+
+Two functions with identical boilerplate → one `calendar-token` function dispatching on HTTP method. Also keeps ADR intact (no client SELECT policy on `user_oauth_tokens`).
+
+**Delete** `supabase/functions/check-calendar-connection/` and `supabase/functions/store-calendar-token/`.
+
+**Create `supabase/functions/calendar-token/index.ts`:**
+
+```typescript
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { requireUser } from '../_shared/auth.ts'
+import { serviceDb } from '../_shared/db.ts'
+import { ok, respondError } from '../_shared/respond.ts'
+import { AppError } from '../_shared/errors.ts'
+
+serve(async (req) => {
+  try {
+    const user = await requireUser(req)
+    if (req.method === 'GET') return await checkConnection(user.id)
+    if (req.method === 'POST') return await storeToken(req, user.id)
+    if (req.method === 'DELETE') return await disconnectToken(user.id)
+    throw new AppError('Method not allowed', 405)
+  } catch (err) {
+    return respondError(err)
+  }
+})
+
+async function checkConnection(userId: string): Promise<Response> {
+  const db = serviceDb()
+  const { data } = await db.from('user_oauth_tokens')
+    .select('id').eq('user_id', userId).eq('provider', 'google').single()
+  return ok({ connected: !!data })
+}
+
+async function storeToken(req: Request, userId: string): Promise<Response> {
+  const session = await getSessionFromAuth(userId)
+  if (!session?.provider_token) throw new AppError('No Google provider token — re-connect Google Calendar', 400)
+
+  const db = serviceDb()
+  const { error } = await db.from('user_oauth_tokens').upsert({
+    user_id: userId,
+    provider: 'google',
+    access_token: session.provider_token,
+    refresh_token: session.provider_refresh_token ?? null,
+    expiry: new Date(Date.now() + 3600 * 1000).toISOString(),
+  }, { onConflict: 'user_id,provider' })
+  if (error) throw new AppError(error.message)
+  return ok({ connected: true })
+}
+
+async function disconnectToken(userId: string): Promise<Response> {
+  const db = serviceDb()
+  const { error } = await db.from('user_oauth_tokens')
+    .delete().eq('user_id', userId).eq('provider', 'google')
+  if (error) throw new AppError(error.message)
+  return ok({ connected: false })
+}
+
+async function getSessionFromAuth(userId: string) {
+  const adminClient = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+  const { data: { user } } = await adminClient.auth.admin.getUserById(userId)
+  const identity = user?.identities?.find(i => i.provider === 'google')
+  return identity?.identity_data as { provider_token?: string; provider_refresh_token?: string } | null
+}
+```
+
+**Update `SettingsPage.tsx`** to use the single endpoint:
+
+```typescript
+// checkConnection → GET /calendar-token
+const res = await supabase.functions.invoke('calendar-token', {
+  method: 'GET',
+  headers: { Authorization: `Bearer ${session.access_token}` },
+})
+
+// captureProviderToken → POST /calendar-token
+const res = await supabase.functions.invoke('calendar-token', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${session.access_token}` },
+})
+
+// disconnectCalendar → DELETE /calendar-token (remove direct DB call)
+const res = await supabase.functions.invoke('calendar-token', {
+  method: 'DELETE',
+  headers: { Authorization: `Bearer ${session.access_token}` },
+})
+```
+
+Remove the direct `supabase.from('user_oauth_tokens').delete()` call from `disconnectCalendar()` — it goes through the edge function now.
+
+---
+
+### S5 Simplification Fix T5 RLS test: remove browser/CDN dependency 
+
+**Location:** Task 23, `tests/e2e/override-flow.spec.ts`
+
+Replace the brittle `page.evaluate` + CDN import approach with a plain Node-side HTTP assertion:
+
+```typescript
+test.describe('T5: Dan (different family) cannot read Alice\'s bookings', () => {
+  test('RLS returns empty result for cross-family query', async () => {
+    // Get Dan's token directly — no browser needed
+    const res = await fetch(
+      `${process.env.VITE_SUPABASE_URL}/auth/v1/token?grant_type=password`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: process.env.VITE_SUPABASE_ANON_KEY!,
+        },
+        body: JSON.stringify({ email: 'user-d@test.carshare', password: 'testpassword123' }),
+      }
+    )
+    const { access_token } = await res.json()
+
+    const bookingsRes = await fetch(
+      `${process.env.VITE_SUPABASE_URL}/rest/v1/bookings?select=id`,
+      {
+        headers: {
+          apikey: process.env.VITE_SUPABASE_ANON_KEY!,
+          Authorization: `Bearer ${access_token}`,
+        },
+      }
+    )
+    const rows = await bookingsRes.json()
+    expect(Array.isArray(rows)).toBe(true)
+    expect(rows).toHaveLength(0)
+  })
+})
+```
+
+---
+
+### Simplification S6 — Delete T6 (calendar-sync test)
+
+**Location:** Task 26, `tests/e2e/calendar-sync.spec.ts`
+
+T6 only asserts that a status field renders correctly — not that sync actually runs. The real sync requires a Google API mock. Delete the file and the task.
+
+```bash
+rm tests/e2e/calendar-sync.spec.ts
+```
+
+The `not_connected` status value is already visible in T1 on the booking detail page — no separate test needed.
+
+---
+
+### Simplification S7 — Deterministic localStorage key in `loginAs()`
+
+**Location:** Amendment A8, `tests/e2e/helpers.ts`
+
+Replace the double-write guess with a deterministic key. Supabase JS v2 for local dev (`http://127.0.0.1:54321`) uses key `sb-127-0-0-1-54321-auth-token`. Store it in `.env.local`:
+
+```
+SUPABASE_STORAGE_KEY=sb-127-0-0-1-54321-auth-token
+```
+
+Replace `loginAs()`:
+
+```typescript
+export async function loginAs(page: Page, email: string, password = 'testpassword123') {
+  const url = process.env.VITE_SUPABASE_URL!
+  const key = process.env.VITE_SUPABASE_ANON_KEY!
+  const storageKey = process.env.SUPABASE_STORAGE_KEY!
+
+  const session = await page.evaluate(
+    async ([supaUrl, supaKey, em, pw]: string[]) => {
+      const r = await fetch(`${supaUrl}/auth/v1/token?grant_type=password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: supaKey },
+        body: JSON.stringify({ email: em, password: pw }),
+      })
+      return r.json()
+    },
+    [url, key, email, password]
+  )
+
+  await page.evaluate(
+    ([k, s]: [string, unknown]) => localStorage.setItem(k, JSON.stringify(s)),
+    [storageKey, session]
+  )
+}
+```
+
