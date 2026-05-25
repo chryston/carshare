@@ -22,8 +22,7 @@ type LocationForm = z.infer<typeof locationSchema>
 
 export function CarDetailPage() {
   const { id } = useParams<{ id: string }>()
-  const { family, myMembership } = useFamily()
-  const isOwner = myMembership?.role === 'owner'
+  const { family } = useFamily()
   const [car, setCar] = useState<Car | null>(null)
   const [addresses, setAddresses] = useState<Address[]>([])
   const [loading, setLoading] = useState(true)
@@ -39,6 +38,7 @@ export function CarDetailPage() {
       supabase.from('addresses').select('id,label,street,city').eq('family_id', family!.id).order('label'),
     ])
     if (carResult.error) { toastError(carResult.error); setLoading(false); return }
+    if (addrResult.error) toastError(addrResult.error)
     setCar(carResult.data)
     setAddresses(addrResult.data ?? [])
     setLoading(false)
