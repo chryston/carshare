@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Navigate, useNavigate } from 'react-router-dom'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
@@ -17,7 +17,7 @@ export function OnboardingPage() {
   const navigate = useNavigate()
   const [tab, setTab] = useState<'create' | 'wait'>('create')
 
-  if (family) { navigate('/calendar'); return null }
+  if (family) return <Navigate to="/calendar" replace />
 
   return (
     <div className="row justify-content-center mt-5">
@@ -49,16 +49,20 @@ function CreateFamilyForm({ userId, onCreated }: { userId: string; onCreated: ()
   })
 
   async function submit({ familyName }: CreateForm) {
-    const { data: family, error: fErr } = await supabase
-      .from('families').insert({ name: familyName }).select().single()
-    if (fErr) throw new AppError(fErr.message)
+    try {
+      const { data: family, error: fErr } = await supabase
+        .from('families').insert({ name: familyName }).select().single()
+      if (fErr) throw new AppError(fErr.message)
 
-    const { error: mErr } = await supabase.from('family_members').insert({
-      family_id: family.id, user_id: userId, role: 'owner', status: 'active', joined_at: new Date().toISOString(),
-    })
-    if (mErr) throw new AppError(mErr.message)
+      const { error: mErr } = await supabase.from('family_members').insert({
+        family_id: family.id, user_id: userId, role: 'owner', status: 'active', joined_at: new Date().toISOString(),
+      })
+      if (mErr) throw new AppError(mErr.message)
 
-    onCreated()
+      onCreated()
+    } catch (err) {
+      toastError(err)
+    }
   }
 
   return (

@@ -8,7 +8,7 @@ export function LoginPage() {
   const session = useSession()
   const navigate = useNavigate()
 
-  useEffect(() => { if (session) navigate('/onboarding') }, [session])
+  useEffect(() => { if (session) navigate('/onboarding') }, [session, navigate])
 
   async function signInWithGoogle() {
     const { error } = await supabase.auth.signInWithOAuth({
