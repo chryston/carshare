@@ -5,6 +5,12 @@ export async function loginAs(page: Page, email: string, password = 'testpasswor
   const url = process.env.VITE_SUPABASE_URL!
   const key = process.env.VITE_SUPABASE_ANON_KEY!
   const storageKey = process.env.SUPABASE_STORAGE_KEY!
+  const baseURL = 'http://localhost:5173'
+
+  // Ensure we're on the app origin so localStorage writes to the correct domain
+  if (!page.url().startsWith(baseURL)) {
+    await page.goto(baseURL)
+  }
 
   const session = await page.evaluate(
     async ([supaUrl, supaKey, em, pw]: string[]) => {
