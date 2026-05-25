@@ -3,10 +3,11 @@ import { crypto } from 'https://deno.land/std@0.168.0/crypto/mod.ts'
 import { encodeHex } from 'https://deno.land/std@0.168.0/encoding/hex.ts'
 import { requireUser } from '../_shared/auth.ts'
 import { serviceDb } from '../_shared/db.ts'
-import { ok, respondError } from '../_shared/respond.ts'
+import { corsHeaders, ok, respondError } from '../_shared/respond.ts'
 import { AppError } from '../_shared/errors.ts'
 
 serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders })
   try {
     return await handleInviteMember(req)
   } catch (err) {

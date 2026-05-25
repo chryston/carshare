@@ -58,11 +58,6 @@ CREATE OR REPLACE FUNCTION override_booking(
 DECLARE
   v_new_id uuid;
 BEGIN
-  -- Validate caller is a family member
-  IF NOT is_family_member(p_family_id) THEN
-    RAISE EXCEPTION 'Not a family member' USING ERRCODE = '42501';
-  END IF;
-
   -- Cancel the conflicting booking
   UPDATE bookings
     SET status = 'cancelled', updated_at = now()
@@ -82,3 +77,13 @@ BEGIN
   RETURN v_new_id;
 END;
 $$;
+
+-- Extension needed for mixed-type exclusion constraints
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+-- Add exclusion constraint to prevent overlapping active bookings for same car
+ALTER TABLE bookings ADD CONSTRAINT no_overlap_active_bookings
+  EXCLUDE USING gist (
+    car_id WITH =,
+    tstzrange(starts_at, ends_at, '[)') WITH &&
+  ) WHERE (status = 'active');

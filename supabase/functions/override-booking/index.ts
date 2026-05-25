@@ -1,11 +1,12 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { requireUser } from '../_shared/auth.ts'
 import { serviceDb } from '../_shared/db.ts'
-import { ok, respondError } from '../_shared/respond.ts'
+import { corsHeaders, ok, respondError } from '../_shared/respond.ts'
 import { AppError } from '../_shared/errors.ts'
 import { fetchAddressSnapshots } from '../_shared/addresses.ts'
 
 serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders })
   try {
     return await handleOverrideBooking(req)
   } catch (err) {
@@ -18,7 +19,9 @@ async function handleOverrideBooking(req: Request): Promise<Response> {
   const body = await parseBody(req)
   await assertIsOwner(user.id, body.family_id)
   validateTimes(body.starts_at, body.ends_at)
-  await fetchAddressSnapshots(body.pickup_address_id, body.dropoff_address_id)
+  if (body.pickup_address_id || body.dropoff_address_id) {
+    await fetchAddressSnapshots(body.pickup_address_id, body.dropoff_address_id)
+  }
   const newBookingId = await atomicOverride(user.id, body)
   return ok({ new_booking_id: newBookingId })
 }

@@ -1,11 +1,12 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { requireUser } from '../_shared/auth.ts'
 import { serviceDb } from '../_shared/db.ts'
-import { ok, respondError } from '../_shared/respond.ts'
+import { corsHeaders, ok, respondError } from '../_shared/respond.ts'
 import { AppError } from '../_shared/errors.ts'
 import { fetchAddressSnapshots } from '../_shared/addresses.ts'
 
 serve(async (req) => {
+  if (req.method === 'OPTIONS') return new Response(null, { headers: corsHeaders })
   try {
     return await handleCreateBooking(req)
   } catch (err) {
