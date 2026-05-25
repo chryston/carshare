@@ -13,7 +13,10 @@ type Car = { id: string; make: string; model: string; year: number | null; plate
 const schema = z.object({
   make: z.string().min(1, 'Make required'),
   model: z.string().min(1, 'Model required'),
-  year: z.coerce.number().int().min(1900).max(2100).optional(),
+  year: z.preprocess(
+    v => (v === '' || v === null ? undefined : v),
+    z.coerce.number().int().min(1900).max(2100).optional()
+  ),
   plate: z.string().min(1, 'Plate required'),
   color: z.string().optional(),
 })
